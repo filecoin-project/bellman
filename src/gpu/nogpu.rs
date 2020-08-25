@@ -15,11 +15,7 @@ impl<E> FFTKernel<E>
 where
     E: ScalarEngine,
 {
-    pub fn create(_: bool) -> GPUResult<FFTKernel<E>> {
-        return Err(GPUError::GPUDisabled);
-    }
-
-    pub fn radix_fft(&mut self, _: &mut [E::Fr], _: &E::Fr, _: u32) -> GPUResult<()> {
+    pub fn radix_fft(_: &DevicePool, _: &mut [E::Fr], _: &E::Fr, _: u32) -> GPUResult<()> {
         return Err(GPUError::GPUDisabled);
     }
 }
@@ -32,12 +28,8 @@ impl<E> MultiexpKernel<E>
 where
     E: ScalarEngine,
 {
-    pub fn create(_: bool) -> GPUResult<MultiexpKernel<E>> {
-        return Err(GPUError::GPUDisabled);
-    }
-
     pub fn multiexp<G>(
-        &mut self,
+        _: &DevicePool,
         _: &Worker,
         _: Arc<Vec<G>>,
         _: Arc<Vec<<<G::Engine as ScalarEngine>::Fr as PrimeField>::Repr>>,
@@ -51,29 +43,10 @@ where
     }
 }
 
-use paired::Engine;
+pub struct DevicePool;
 
-macro_rules! locked_kernel {
-    ($class:ident) => {
-        pub struct $class<E>(PhantomData<E>);
-
-        impl<E> $class<E>
-        where
-            E: Engine,
-        {
-            pub fn new(_: usize, _: bool) -> $class<E> {
-                $class::<E>(PhantomData)
-            }
-
-            pub fn with<F, R, K>(&mut self, _: F) -> GPUResult<R>
-            where
-                F: FnMut(&mut K) -> GPUResult<R>,
-            {
-                return Err(GPUError::GPUDisabled);
-            }
-        }
-    };
+impl Default for DevicePool {
+    fn default() -> Self {
+        Self
+    }
 }
-
-locked_kernel!(LockedFFTKernel);
-locked_kernel!(LockedMultiexpKernel);

@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 use super::{BatchPreparedVerifyingKey, PreparedVerifyingKey, Proof, VerifyingKey};
-use crate::gpu::LockedMultiexpKernel;
+use crate::gpu::DevicePool;
 use crate::multicore::Worker;
 use crate::multiexp::{multiexp, FullDensity};
 use crate::SynthesisError;
@@ -126,7 +126,7 @@ where
         })
         .collect();
 
-    let mut multiexp_kern = get_verifier_kernel(pi_num);
+    let device_pool = get_verifier_pool();
 
     // create group element corresponding to public input combination
     // This roughly corresponds to Accum_Gamma in spec
@@ -137,7 +137,7 @@ where
             (Arc::new(pvk.ic[1..].to_vec()), 0),
             FullDensity,
             Arc::new(pi_scalars),
-            &mut multiexp_kern,
+            &device_pool,
         )
         .wait()
         .unwrap(),
@@ -189,15 +189,12 @@ where
     Ok(E::final_exponentiation(&res).unwrap() == acc_y)
 }
 
-fn get_verifier_kernel<E: Engine>(pi_num: usize) -> Option<LockedMultiexpKernel<E>> {
+fn get_verifier_pool() -> Option<DevicePool> {
     match &std::env::var("BELLMAN_VERIFIER")
         .unwrap_or("auto".to_string())
         .to_lowercase()[..]
     {
-        "gpu" => {
-            let log_d = (pi_num as f32).log2().ceil() as usize;
-            Some(LockedMultiexpKernel::<E>::new(log_d, false))
-        }
+        "gpu" => Some(DevicePool::default()),
         "cpu" => None,
         "auto" => None,
         s => panic!("Invalid verifier device selected: {}", s),

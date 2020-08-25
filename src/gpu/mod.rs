@@ -3,10 +3,10 @@ mod error;
 pub use self::error::*;
 
 #[cfg(feature = "gpu")]
-mod locks;
+mod scheduler;
 
 #[cfg(feature = "gpu")]
-pub use self::locks::*;
+pub use scheduler::*;
 
 #[cfg(feature = "gpu")]
 mod sources;

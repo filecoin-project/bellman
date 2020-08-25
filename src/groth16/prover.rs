@@ -9,16 +9,13 @@ use rayon::prelude::*;
 
 use super::{ParameterSource, Proof};
 use crate::domain::{EvaluationDomain, Scalar};
-use crate::gpu::{LockedFFTKernel, LockedMultiexpKernel};
+use crate::gpu::DevicePool;
 use crate::multicore::{Worker, THREAD_POOL};
 use crate::multiexp::{multiexp, DensityTracker, FullDensity};
 use crate::{
     Circuit, ConstraintSystem, Index, LinearCombination, SynthesisError, Variable, BELLMAN_VERSION,
 };
 use log::info;
-
-#[cfg(feature = "gpu")]
-use crate::gpu::PriorityLock;
 
 fn eval<E: Engine>(
     lc: &LinearCombination<E>,
@@ -281,7 +278,7 @@ fn create_proof_batch_priority_inner<E, C, P: ParameterSource<E>>(
     params: P,
     r_s: Vec<E::Fr>,
     s_s: Vec<E::Fr>,
-    priority: bool,
+    _priority: bool,
 ) -> Result<Vec<Proof<E>>, SynthesisError>
 where
     E: Engine,
@@ -318,19 +315,7 @@ where
         );
     }
 
-    let mut log_d = 0;
-    while (1 << log_d) < n {
-        log_d += 1;
-    }
-
-    #[cfg(feature = "gpu")]
-    let prio_lock = if priority {
-        Some(PriorityLock::lock())
-    } else {
-        None
-    };
-
-    let mut fft_kern = Some(LockedFFTKernel::<E>::new(log_d, priority));
+    let device_pool = Some(DevicePool::default());
 
     let a_s = provers
         .iter_mut()
@@ -342,19 +327,19 @@ where
             let mut c =
                 EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.c, Vec::new()))?;
 
-            a.ifft(&worker, &mut fft_kern)?;
-            a.coset_fft(&worker, &mut fft_kern)?;
-            b.ifft(&worker, &mut fft_kern)?;
-            b.coset_fft(&worker, &mut fft_kern)?;
-            c.ifft(&worker, &mut fft_kern)?;
-            c.coset_fft(&worker, &mut fft_kern)?;
+            a.ifft(&worker, &device_pool)?;
+            a.coset_fft(&worker, &device_pool)?;
+            b.ifft(&worker, &device_pool)?;
+            b.coset_fft(&worker, &device_pool)?;
+            c.ifft(&worker, &device_pool)?;
+            c.coset_fft(&worker, &device_pool)?;
 
             a.mul_assign(&worker, &b);
             drop(b);
             a.sub_assign(&worker, &c);
             drop(c);
             a.divide_by_z_on_coset(&worker);
-            a.icoset_fft(&worker, &mut fft_kern)?;
+            a.icoset_fft(&worker, &device_pool)?;
             let mut a = a.into_coeffs();
             let a_len = a.len() - 1;
             a.truncate(a_len);
@@ -365,9 +350,6 @@ where
         })
         .collect::<Result<Vec<_>, SynthesisError>>()?;
 
-    drop(fft_kern);
-    let mut multiexp_kern = Some(LockedMultiexpKernel::<E>::new(log_d, priority));
-
     let h_s = a_s
         .into_iter()
         .map(|a| {
@@ -376,7 +358,7 @@ where
                 params.get_h(a.len())?,
                 FullDensity,
                 a,
-                &mut multiexp_kern,
+                &device_pool,
             );
             Ok(h)
         })
@@ -416,7 +398,7 @@ where
                 params.get_l(aux_assignment.len())?,
                 FullDensity,
                 aux_assignment.clone(),
-                &mut multiexp_kern,
+                &device_pool,
             );
             Ok(l)
         })
@@ -437,7 +419,7 @@ where
                 a_inputs_source,
                 FullDensity,
                 input_assignment.clone(),
-                &mut multiexp_kern,
+                &device_pool,
             );
 
             let a_aux = multiexp(
@@ -445,7 +427,7 @@ where
                 a_aux_source,
                 Arc::new(prover.a_aux_density),
                 aux_assignment.clone(),
-                &mut multiexp_kern,
+                &device_pool,
             );
 
             let b_input_density = Arc::new(prover.b_input_density);
@@ -461,7 +443,7 @@ where
                 b_g1_inputs_source,
                 b_input_density.clone(),
                 input_assignment.clone(),
-                &mut multiexp_kern,
+                &device_pool,
             );
 
             let b_g1_aux = multiexp(
@@ -469,7 +451,7 @@ where
                 b_g1_aux_source,
                 b_aux_density.clone(),
                 aux_assignment.clone(),
-                &mut multiexp_kern,
+                &device_pool,
             );
 
             let (b_g2_inputs_source, b_g2_aux_source) =
@@ -480,14 +462,14 @@ where
                 b_g2_inputs_source,
                 b_input_density,
                 input_assignment.clone(),
-                &mut multiexp_kern,
+                &device_pool,
             );
             let b_g2_aux = multiexp(
                 &worker,
                 b_g2_aux_source,
                 b_aux_density,
                 aux_assignment.clone(),
-                &mut multiexp_kern,
+                &device_pool,
             );
 
             Ok((
@@ -500,11 +482,6 @@ where
             ))
         })
         .collect::<Result<Vec<_>, SynthesisError>>()?;
-
-    drop(multiexp_kern);
-
-    #[cfg(feature = "gpu")]
-    drop(prio_lock);
 
     let proofs = h_s
         .into_iter()
