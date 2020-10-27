@@ -67,6 +67,43 @@ __kernel void radix_fft(__global FIELD* x, // Source buffer
   }
 }
 
+/*
+ * Bitreverse elements before doing inplace FFT
+ */
+__kernel void reverse_bits(__global FIELD* a, // Source buffer
+                           uint lgn) // Log2 of n
+{
+  uint k = get_global_id(0);
+  uint rk = bitreverse(k, lgn);
+  if(k < rk) {
+    FIELD old = a[rk];
+    a[rk] = a[k];
+    a[k] = old;
+  }
+}
+
+/*
+ * Inplace FFT algorithm, uses 1/2 less memory than radix-fft
+ * Inspired from original bellman FFT implementation
+ */
+__kernel void inplace_fft(__global FIELD* a, // Source buffer
+                          __global FIELD* omegas, // [omega, omega^2, omega^4, ...]
+                          uint lgn,
+                          uint lgm) // Log2 of n
+{
+  uint gid = get_global_id(0);
+  uint n = 1 << lgn;
+  uint m = 1 << lgm;
+  uint j = gid & (m - 1);
+  uint k = 2 * m * (gid >> lgm);
+  FIELD w = FIELD_pow_lookup(omegas, j << (lgn - 1 - lgm));
+  FIELD t = FIELD_mul(a[k + j + m], w);
+  FIELD tmp = a[k + j];
+  tmp = FIELD_sub(tmp, t);
+  a[k + j + m] = tmp;
+  a[k + j] = FIELD_add(a[k + j], t);
+}
+
 /// Multiplies all of the elements by `field`
 __kernel void mul_by_field(__global FIELD* elements,
                         uint n,

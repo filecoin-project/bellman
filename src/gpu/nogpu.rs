@@ -19,7 +19,7 @@ where
         return Err(GPUError::GPUDisabled);
     }
 
-    pub fn radix_fft(&mut self, _: &mut [E::Fr], _: &E::Fr, _: u32) -> GPUResult<()> {
+    pub fn fft(&mut self, _: &mut [E::Fr], _: &E::Fr, _: u32) -> GPUResult<()> {
         return Err(GPUError::GPUDisabled);
     }
 }

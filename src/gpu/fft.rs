@@ -3,7 +3,7 @@ use crate::gpu::{
     locks, sources,
 };
 use ff::Field;
-use log::info;
+use log::{info, warn};
 use paired::Engine;
 use rust_gpu_tools::*;
 use std::cmp;
@@ -147,5 +147,46 @@ where
         src_buffer.read_into(0, a)?;
 
         Ok(())
+    }
+
+    /// Performs inplace FFT on `a`
+    /// * `omega` - Special value `omega` is used for FFT over finite-fields
+    /// * `lgn` - Specifies log2 of number of elements
+    pub fn inplace_fft(&mut self, a: &mut [E::Fr], omega: &E::Fr, log_n: u32) -> GPUResult<()> {
+        if locks::PriorityLock::should_break(self.priority) {
+            return Err(GPUError::GPUTaken);
+        }
+
+        let n = 1 << log_n;
+
+        let mut fft_buffer = self.program.create_buffer::<E::Fr>(n)?;
+
+        let max_deg = cmp::min(MAX_LOG2_RADIX, log_n);
+        self.setup_pq_omegas(omega, n, max_deg)?;
+
+        fft_buffer.write_from(&*a)?;
+
+        let kernel = self.program.create_kernel("reverse_bits", n, None);
+        call_kernel!(kernel, &fft_buffer, log_n)?;
+
+        for log_m in 0..log_n {
+            let kernel = self.program.create_kernel("inplace_fft", n >> 1, None);
+            call_kernel!(kernel, &fft_buffer, &self.omegas_buffer, log_n, log_m)?;
+        }
+
+        fft_buffer.read_into(a)?;
+
+        Ok(())
+    }
+
+    pub fn fft(&mut self, a: &mut [E::Fr], omega: &E::Fr, lgn: u32) -> GPUResult<()> {
+        const MIN_RADIX_MEMORY: u64 = 9 * 1024 * 1024 * 1024; // 9GB
+        let mem = self.program.device().memory();
+        if mem > MIN_RADIX_MEMORY {
+            self.radix_fft(a, omega, lgn)
+        } else {
+            warn!("FFT: Memory not enough for radix_fft! Using inplace_fft instead...");
+            self.inplace_fft(a, omega, lgn)
+        }
     }
 }
