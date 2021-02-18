@@ -149,6 +149,10 @@ pub mod multicore;
 pub mod multiexp;
 
 pub mod util_cs;
+
+#[macro_use]
+pub(crate) mod macros;
+
 use ff::{Field, ScalarEngine};
 
 use rustc_hash::FxHashMap as HashMap;

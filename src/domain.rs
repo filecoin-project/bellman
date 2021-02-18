@@ -12,10 +12,10 @@
 //! [Groth16]: https://eprint.iacr.org/2016/260
 
 use crate::bls::Engine;
+use crate::multicore::Worker;
 use ff::{Field, PrimeField, ScalarEngine};
 use groupy::CurveProjective;
 
-use super::multicore::Worker;
 use super::SynthesisError;
 
 use crate::gpu;

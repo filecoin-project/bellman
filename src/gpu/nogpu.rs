@@ -1,5 +1,4 @@
 use super::error::{GPUError, GPUResult};
-use crate::multicore::Worker;
 use ff::{PrimeField, ScalarEngine};
 use groupy::CurveAffine;
 use std::marker::PhantomData;
@@ -38,7 +37,6 @@ where
 
     pub fn multiexp<G>(
         &mut self,
-        _: &Worker,
         _: Arc<Vec<G>>,
         _: Arc<Vec<<<G::Engine as ScalarEngine>::Fr as PrimeField>::Repr>>,
         _: usize,
@@ -72,8 +70,13 @@ macro_rules! locked_kernel {
                 return Err(GPUError::GPUDisabled);
             }
         }
+
+        unsafe impl<E: Engine> Send for $class<E> {}
     };
 }
 
 locked_kernel!(LockedFFTKernel);
 locked_kernel!(LockedMultiexpKernel);
+
+#[derive(Debug)]
+pub struct PriorityLock;

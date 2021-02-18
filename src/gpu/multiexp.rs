@@ -3,8 +3,9 @@ use super::locks;
 use super::sources;
 use super::utils;
 use crate::bls::Engine;
-use crate::multicore::Worker;
 use crate::multiexp::{multiexp as cpu_multiexp, FullDensity};
+use crate::par;
+
 use ff::{PrimeField, ScalarEngine};
 use groupy::{CurveAffine, CurveProjective};
 use log::{error, info};
@@ -265,7 +266,6 @@ where
 
     pub fn multiexp<G>(
         &mut self,
-        pool: &Worker,
         bases: Arc<Vec<G>>,
         exps: Arc<Vec<<<G::Engine as ScalarEngine>::Fr as PrimeField>::Repr>>,
         skip: usize,
@@ -288,47 +288,45 @@ where
 
         let chunk_size = ((n as f64) / (num_devices as f64)).ceil() as usize;
 
-        let mut acc = <G as CurveAffine>::Projective::zero();
+        par! {
+            let cpu_acc = cpu_multiexp(
+                (Arc::new(cpu_bases.to_vec()), 0),
+                FullDensity,
+                Arc::new(cpu_exps.to_vec()),
+                &mut None,
+            ),
+            let acc = {
+                if n > 0 {
+                    bases
+                        .par_chunks(chunk_size)
+                        .zip(exps.par_chunks(chunk_size))
+                        .zip(self.kernels.par_iter_mut())
+                        .map(|((bases, exps), kern)| -> Result<<G as CurveAffine>::Projective, GPUError> {
+                            let mut acc = <G as CurveAffine>::Projective::zero();
+                            for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
+                                let result = kern.multiexp(bases, exps, bases.len())?;
+                                acc.add_assign(&result);
+                            }
 
-        let results = crate::multicore::THREAD_POOL.install(|| {
-            if n > 0 {
-                bases
-                .par_chunks(chunk_size)
-                .zip(exps.par_chunks(chunk_size))
-                .zip(self.kernels.par_iter_mut())
-                .map(|((bases, exps), kern)| -> Result<<G as CurveAffine>::Projective, GPUError> {
-                    let mut acc = <G as CurveAffine>::Projective::zero();
-                    for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
-                        match kern.multiexp(bases, exps, bases.len()) {
-                            Ok(result) => acc.add_assign(&result),
-                            Err(e) => return Err(e),
-                        }
-                    }
-
-                    Ok(acc)
-                })
-                .collect::<Vec<_>>()
-            } else {
-                Vec::new()
+                            Ok(acc)
+                        })
+                        .try_fold(|| <G as CurveAffine>::Projective::zero(), |mut acc, part| -> Result<_, GPUError> {
+                            acc.add_assign(&part?);
+                            Ok(acc)
+                        })
+                        .try_reduce(|| <G as CurveAffine>::Projective::zero(), |mut acc, part| -> Result<_, GPUError> {
+                            acc.add_assign(&part);
+                            Ok(acc)
+                        })
+                } else {
+                    Ok(<G as CurveAffine>::Projective::zero())
+                }
             }
-        });
+        };
 
-        let cpu_acc = cpu_multiexp(
-            &pool,
-            (Arc::new(cpu_bases.to_vec()), 0),
-            FullDensity,
-            Arc::new(cpu_exps.to_vec()),
-            &mut None,
-        );
-
-        for r in results {
-            match r {
-                Ok(r) => acc.add_assign(&r),
-                Err(e) => return Err(e),
-            }
-        }
-
-        acc.add_assign(&cpu_acc.wait().unwrap());
+        let cpu_acc = cpu_acc.map_err(|_| GPUError::Simple("cpu multiexp failed"))?;
+        let mut acc = acc?;
+        acc.add_assign(&cpu_acc);
 
         Ok(acc)
     }
