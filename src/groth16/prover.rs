@@ -1,26 +1,40 @@
+use super::BellTaskType;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::bls::Engine;
 use ff::{Field, PrimeField};
 use groupy::{CurveAffine, CurveProjective};
 use rand_core::RngCore;
 use rayon::prelude::*;
 
+#[cfg(feature = "blst")]
+use crate::bls::Engine;
+#[cfg(feature = "pairing")]
+use paired::Engine;
+
 use super::{ParameterSource, Proof};
 use crate::domain::{EvaluationDomain, Scalar};
 use crate::gpu::{LockedFFTKernel, LockedMultiexpKernel};
-use crate::multicore::{Worker, THREAD_POOL};
+use crate::multicore::{Waiter, Worker, THREAD_POOL};
 use crate::multiexp::{multiexp, DensityTracker, FullDensity};
 use crate::{
     Circuit, ConstraintSystem, Index, LinearCombination, SynthesisError, Variable, BELLMAN_VERSION,
 };
-use log::info;
-#[cfg(feature = "gpu")]
-use log::trace;
 
-#[cfg(feature = "gpu")]
-use crate::gpu::PriorityLock;
+use log::info;
+
+use super::{FftSolver, MultiexpSolver};
+
+// The return type of Fft calls
+type Repr<E> = Arc<Vec<<<E as ff::ScalarEngine>::Fr as ff::PrimeField>::Repr>>;
+type InputsResult<E> = (
+    Waiter<Result<<E as Engine>::G1, SynthesisError>>,
+    Waiter<Result<<E as Engine>::G1, SynthesisError>>,
+    Waiter<Result<<E as Engine>::G1, SynthesisError>>,
+    Waiter<Result<<E as Engine>::G1, SynthesisError>>,
+    Waiter<Result<<E as Engine>::G2, SynthesisError>>,
+    Waiter<Result<<E as Engine>::G2, SynthesisError>>,
+);
 
 fn eval<E: Engine>(
     lc: &LinearCombination<E>,
@@ -249,7 +263,7 @@ pub fn create_random_proof_batch_priority<E, C, R, P: ParameterSource<E>>(
     circuits: Vec<C>,
     params: P,
     rng: &mut R,
-    priority: bool,
+    task_type: Option<BellTaskType>,
 ) -> Result<Vec<Proof<E>>, SynthesisError>
 where
     E: Engine,
@@ -258,8 +272,7 @@ where
 {
     let r_s = (0..circuits.len()).map(|_| E::Fr::random(rng)).collect();
     let s_s = (0..circuits.len()).map(|_| E::Fr::random(rng)).collect();
-
-    create_proof_batch_priority::<E, C, P>(circuits, params, r_s, s_s, priority)
+    create_proof_batch_priority::<E, C, P>(circuits, params, r_s, s_s, task_type)
 }
 
 pub fn create_proof_batch_priority<E, C, P: ParameterSource<E>>(
@@ -267,7 +280,7 @@ pub fn create_proof_batch_priority<E, C, P: ParameterSource<E>>(
     params: P,
     r_s: Vec<E::Fr>,
     s_s: Vec<E::Fr>,
-    priority: bool,
+    task_type: Option<BellTaskType>,
 ) -> Result<Vec<Proof<E>>, SynthesisError>
 where
     E: Engine,
@@ -302,159 +315,203 @@ where
         log_d += 1;
     }
 
-    #[cfg(feature = "gpu")]
-    let prio_lock = if priority {
-        trace!("acquiring priority lock");
-        Some(PriorityLock::lock())
-    } else {
-        None
+    let as_call = |skip: usize,
+                   fft_kern: &mut Option<LockedFFTKernel<E>>|
+     -> Option<Result<Repr<E>, SynthesisError>> {
+        provers
+            .iter_mut()
+            .skip(skip)
+            // We perform 1 iteration beetwen scheduler calls. It introduces an overhead, which
+            // can be avoided if we group the total amount of iterations in chunks of 2, 5, so on.
+            // in order to improve performance
+            .take(1)
+            .map(|prover| {
+                let mut a =
+                    EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.a, Vec::new()))?;
+                let mut b =
+                    EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.b, Vec::new()))?;
+                let mut c =
+                    EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.c, Vec::new()))?;
+
+                a.ifft(&worker, fft_kern)?;
+                a.coset_fft(&worker, fft_kern)?;
+                b.ifft(&worker, fft_kern)?;
+                b.coset_fft(&worker, fft_kern)?;
+                c.ifft(&worker, fft_kern)?;
+                c.coset_fft(&worker, fft_kern)?;
+
+                a.mul_assign(&worker, &b);
+                drop(b);
+                a.sub_assign(&worker, &c);
+                drop(c);
+                a.divide_by_z_on_coset(&worker);
+                a.icoset_fft(&worker, fft_kern)?;
+                let mut a = a.into_coeffs();
+                let a_len = a.len() - 1;
+                a.truncate(a_len);
+
+                Ok(Arc::new(
+                    a.into_iter().map(|s| s.0.into_repr()).collect::<Vec<_>>(),
+                ))
+            })
+            .next()
     };
 
-    let mut fft_kern = Some(LockedFFTKernel::<E>::new(log_d, priority));
+    let mut as_solver = FftSolver::new(log_d, as_call);
+    as_solver
+        .solve(task_type)
+        .map_err(|e| SynthesisError::Other(e.to_string()))?;
+    let a_s = as_solver.accumulator;
 
-    let a_s = provers
-        .iter_mut()
-        .map(|prover| {
-            let mut a =
-                EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.a, Vec::new()))?;
-            let mut b =
-                EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.b, Vec::new()))?;
-            let mut c =
-                EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.c, Vec::new()))?;
+    let hs_call = |skip: usize,
+                   multiexp_kern: &mut Option<LockedMultiexpKernel<E>>|
+     -> Option<
+        Result<crate::multicore::Waiter<Result<<E as Engine>::G1, SynthesisError>>, SynthesisError>,
+    > {
+        a_s.iter()
+            .skip(skip)
+            .take(1)
+            .map(|a| {
+                let h = multiexp(
+                    &worker,
+                    params.get_h(a.len())?,
+                    FullDensity,
+                    a.clone(),
+                    multiexp_kern,
+                );
+                Ok(h)
+            })
+            .next()
+    };
 
-            a.ifft(&worker, &mut fft_kern)?;
-            a.coset_fft(&worker, &mut fft_kern)?;
-            b.ifft(&worker, &mut fft_kern)?;
-            b.coset_fft(&worker, &mut fft_kern)?;
-            c.ifft(&worker, &mut fft_kern)?;
-            c.coset_fft(&worker, &mut fft_kern)?;
+    let mut hs_solver = MultiexpSolver::new(log_d, hs_call);
+    hs_solver
+        .solve(task_type)
+        .map_err(|e| SynthesisError::Other(e.to_string()))?;
+    let h_s = hs_solver.accumulator;
 
-            a.mul_assign(&worker, &b);
-            drop(b);
-            a.sub_assign(&worker, &c);
-            drop(c);
-            a.divide_by_z_on_coset(&worker);
-            a.icoset_fft(&worker, &mut fft_kern)?;
-            let mut a = a.into_coeffs();
-            let a_len = a.len() - 1;
-            a.truncate(a_len);
+    let ls_call = |skip: usize,
+                   multiexp_kern: &mut Option<LockedMultiexpKernel<E>>|
+     -> Option<
+        Result<crate::multicore::Waiter<Result<<E as Engine>::G1, SynthesisError>>, SynthesisError>,
+    > {
+        aux_assignments
+            .iter()
+            .skip(skip)
+            .take(1)
+            .map(|aux_assignment| {
+                let l = multiexp(
+                    &worker,
+                    params.get_l(aux_assignment.len())?,
+                    FullDensity,
+                    aux_assignment.clone(),
+                    multiexp_kern,
+                );
+                Ok(l)
+            })
+            .next()
+    };
 
-            Ok(Arc::new(
-                a.into_iter().map(|s| s.0.into_repr()).collect::<Vec<_>>(),
-            ))
-        })
-        .collect::<Result<Vec<_>, SynthesisError>>()?;
+    let mut ls_solver = MultiexpSolver::new(log_d, ls_call);
 
-    drop(fft_kern);
-    let mut multiexp_kern = Some(LockedMultiexpKernel::<E>::new(log_d, priority));
+    ls_solver
+        .solve(task_type)
+        .map_err(|e| SynthesisError::Other(e.to_string()))?;
 
-    let h_s = a_s
-        .into_iter()
-        .map(|a| {
-            let h = multiexp(
-                &worker,
-                params.get_h(a.len())?,
-                FullDensity,
-                a,
-                &mut multiexp_kern,
-            );
-            Ok(h)
-        })
-        .collect::<Result<Vec<_>, SynthesisError>>()?;
+    let l_s = ls_solver.accumulator;
 
-    let l_s = aux_assignments
-        .iter()
-        .map(|aux_assignment| {
-            let l = multiexp(
-                &worker,
-                params.get_l(aux_assignment.len())?,
-                FullDensity,
-                aux_assignment.clone(),
-                &mut multiexp_kern,
-            );
-            Ok(l)
-        })
-        .collect::<Result<Vec<_>, SynthesisError>>()?;
+    let inputs_call = |skip: usize,
+                       multiexp_kern: &mut Option<LockedMultiexpKernel<E>>|
+     -> Option<Result<InputsResult<E>, SynthesisError>> {
+        provers
+            .iter()
+            .skip(skip)
+            .take(1)
+            .zip(input_assignments.iter().skip(skip).take(1))
+            .zip(aux_assignments.iter().skip(skip).take(1))
+            .map(|((prover, input_assignment), aux_assignment)| {
+                let a_aux_density_total = prover.a_aux_density.get_total_density();
 
-    let inputs = provers
-        .into_iter()
-        .zip(input_assignments.iter())
-        .zip(aux_assignments.iter())
-        .map(|((prover, input_assignment), aux_assignment)| {
-            let a_aux_density_total = prover.a_aux_density.get_total_density();
+                let (a_inputs_source, a_aux_source) =
+                    params.get_a(input_assignment.len(), a_aux_density_total)?;
 
-            let (a_inputs_source, a_aux_source) =
-                params.get_a(input_assignment.len(), a_aux_density_total)?;
+                let a_inputs = multiexp(
+                    &worker,
+                    a_inputs_source,
+                    FullDensity,
+                    input_assignment.clone(),
+                    multiexp_kern,
+                );
 
-            let a_inputs = multiexp(
-                &worker,
-                a_inputs_source,
-                FullDensity,
-                input_assignment.clone(),
-                &mut multiexp_kern,
-            );
+                let a_aux = multiexp(
+                    &worker,
+                    a_aux_source,
+                    Arc::new(prover.a_aux_density.clone()),
+                    aux_assignment.clone(),
+                    multiexp_kern,
+                );
 
-            let a_aux = multiexp(
-                &worker,
-                a_aux_source,
-                Arc::new(prover.a_aux_density),
-                aux_assignment.clone(),
-                &mut multiexp_kern,
-            );
+                let b_input_density = Arc::new(prover.b_input_density.clone());
+                let b_input_density_total = b_input_density.get_total_density();
+                let b_aux_density = Arc::new(prover.b_aux_density.clone());
+                let b_aux_density_total = b_aux_density.get_total_density();
 
-            let b_input_density = Arc::new(prover.b_input_density);
-            let b_input_density_total = b_input_density.get_total_density();
-            let b_aux_density = Arc::new(prover.b_aux_density);
-            let b_aux_density_total = b_aux_density.get_total_density();
+                let (b_g1_inputs_source, b_g1_aux_source) =
+                    params.get_b_g1(b_input_density_total, b_aux_density_total)?;
 
-            let (b_g1_inputs_source, b_g1_aux_source) =
-                params.get_b_g1(b_input_density_total, b_aux_density_total)?;
+                let b_g1_inputs = multiexp(
+                    &worker,
+                    b_g1_inputs_source,
+                    b_input_density.clone(),
+                    input_assignment.clone(),
+                    multiexp_kern,
+                );
 
-            let b_g1_inputs = multiexp(
-                &worker,
-                b_g1_inputs_source,
-                b_input_density.clone(),
-                input_assignment.clone(),
-                &mut multiexp_kern,
-            );
+                let b_g1_aux = multiexp(
+                    &worker,
+                    b_g1_aux_source,
+                    b_aux_density.clone(),
+                    aux_assignment.clone(),
+                    multiexp_kern,
+                );
 
-            let b_g1_aux = multiexp(
-                &worker,
-                b_g1_aux_source,
-                b_aux_density.clone(),
-                aux_assignment.clone(),
-                &mut multiexp_kern,
-            );
+                let (b_g2_inputs_source, b_g2_aux_source) =
+                    params.get_b_g2(b_input_density_total, b_aux_density_total)?;
 
-            let (b_g2_inputs_source, b_g2_aux_source) =
-                params.get_b_g2(b_input_density_total, b_aux_density_total)?;
+                let b_g2_inputs = multiexp(
+                    &worker,
+                    b_g2_inputs_source,
+                    b_input_density,
+                    input_assignment.clone(),
+                    multiexp_kern,
+                );
+                let b_g2_aux = multiexp(
+                    &worker,
+                    b_g2_aux_source,
+                    b_aux_density,
+                    aux_assignment.clone(),
+                    multiexp_kern,
+                );
 
-            let b_g2_inputs = multiexp(
-                &worker,
-                b_g2_inputs_source,
-                b_input_density,
-                input_assignment.clone(),
-                &mut multiexp_kern,
-            );
-            let b_g2_aux = multiexp(
-                &worker,
-                b_g2_aux_source,
-                b_aux_density,
-                aux_assignment.clone(),
-                &mut multiexp_kern,
-            );
+                Ok((
+                    a_inputs,
+                    a_aux,
+                    b_g1_inputs,
+                    b_g1_aux,
+                    b_g2_inputs,
+                    b_g2_aux,
+                ))
+            })
+            .next()
+    };
 
-            Ok((
-                a_inputs,
-                a_aux,
-                b_g1_inputs,
-                b_g1_aux,
-                b_g2_inputs,
-                b_g2_aux,
-            ))
-        })
-        .collect::<Result<Vec<_>, SynthesisError>>()?;
-    drop(multiexp_kern);
+    let mut inputs_solver = MultiexpSolver::new(log_d, inputs_call);
+
+    inputs_solver
+        .solve(task_type)
+        .map_err(|e| SynthesisError::Other(e.to_string()))?;
+
+    let inputs = inputs_solver.accumulator;
 
     let proofs = h_s
         .into_iter()
@@ -512,14 +569,9 @@ where
         )
         .collect::<Result<Vec<_>, SynthesisError>>()?;
 
-    #[cfg(feature = "gpu")]
-    {
-        trace!("dropping priority lock");
-        drop(prio_lock);
-    }
-
     let proof_time = start.elapsed();
     info!("prover time: {:?}", proof_time);
+    println!("prover time: {:?}", proof_time);
 
     Ok(proofs)
 }

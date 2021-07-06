@@ -42,8 +42,8 @@ impl<E: Engine> Circuit<E> for DummyDemo {
 pub fn test_parallel_prover() {
     use bellperson::bls::Bls12;
     use bellperson::groth16::{
-        create_random_proof, create_random_proof_in_priority, generate_random_parameters,
-        prepare_verifying_key, verify_proof,
+        create_random_proof, create_random_proof_with_type, generate_random_parameters,
+        prepare_verifying_key, verify_proof, BellTaskType,
     };
     use rand::thread_rng;
     use std::thread;
@@ -82,7 +82,13 @@ pub fn test_parallel_prover() {
             let now = Instant::now();
 
             let rng = &mut thread_rng();
-            let proof_higher = create_random_proof_in_priority(c.clone(), &params, rng).unwrap();
+            let proof_higher = create_random_proof_with_type(
+                c.clone(),
+                &params,
+                rng,
+                Some(BellTaskType::WinningPost),
+            )
+            .unwrap();
             assert!(verify_proof(&pvk, &proof_higher, &[]).unwrap());
 
             println!(

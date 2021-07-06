@@ -1,12 +1,14 @@
 use crate::bls::Engine;
 use crate::gpu::{
     error::{GPUError, GPUResult},
-    locks, sources,
+    sources,
 };
 use ff::Field;
-use log::info;
+use log::{info, warn};
 use rust_gpu_tools::*;
 use std::cmp;
+
+use scheduler_client::ResourceAlloc;
 
 const LOG2_MAX_ELEMENTS: usize = 32; // At most 2^32 elements is supported.
 const MAX_LOG2_RADIX: u32 = 8; // Radix256
@@ -19,24 +21,28 @@ where
     program: opencl::Program,
     pq_buffer: opencl::Buffer<E::Fr>,
     omegas_buffer: opencl::Buffer<E::Fr>,
-    _lock: locks::GPULock, // RFC 1857: struct fields are dropped in the same order as they are declared.
-    priority: bool,
 }
 
 impl<E> FFTKernel<E>
 where
     E: Engine,
 {
-    pub fn create(priority: bool) -> GPUResult<FFTKernel<E>> {
-        let lock = locks::GPULock::lock();
-
-        let devices = opencl::Device::all();
-        if devices.is_empty() {
-            return Err(GPUError::Simple("No working GPUs found!"));
-        }
-
-        // Select the first device for FFT
-        let device = devices[0].clone();
+    pub fn create(alloc: Option<&ResourceAlloc>) -> GPUResult<FFTKernel<E>> {
+        let device = if let Some(alloc) = alloc {
+            let devs = alloc
+                .devices
+                .iter()
+                .filter_map(|id| id.get_device())
+                .collect::<Vec<_>>();
+            if devs.is_empty() {
+                return Err(GPUError::Simple("No working GPUs found!"));
+            }
+            devs[0].clone()
+        } else {
+            // Select the first device for FFT
+            let devices = opencl::Device::all();
+            devices[0].clone()
+        };
 
         let src = sources::kernel::<E>(device.brand() == opencl::Brand::Nvidia);
 
@@ -45,14 +51,12 @@ where
         let omegas_buffer = program.create_buffer::<E::Fr>(LOG2_MAX_ELEMENTS)?;
 
         info!("FFT: 1 working device(s) selected.");
-        info!("FFT: Device 0: {}", program.device().name());
+        info!("FFT: Device: {}", program.device().name());
 
         Ok(FFTKernel {
             program,
             pq_buffer,
             omegas_buffer,
-            _lock: lock,
-            priority,
         })
     }
 
@@ -70,10 +74,6 @@ where
         deg: u32,
         max_deg: u32,
     ) -> GPUResult<()> {
-        if locks::PriorityLock::should_break(self.priority) {
-            return Err(GPUError::GPUTaken);
-        }
-
         let n = 1u32 << log_n;
         let local_work_size = 1 << cmp::min(deg - 1, MAX_LOG2_LOCAL_WORK_SIZE);
         let global_work_size = (n >> deg) * local_work_size;
@@ -92,7 +92,11 @@ where
             .arg(log_p)
             .arg(deg)
             .arg(max_deg)
-            .run()?;
+            .run()
+            .or_else(|e| {
+                warn!("FFT kernel error {}", e.to_string());
+                Err(e)
+            })?;
         Ok(())
     }
 
