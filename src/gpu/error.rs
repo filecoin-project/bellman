@@ -18,6 +18,8 @@ pub enum GPUError {
     KernelUninitialized,
     #[error("GPU accelerator is disabled!")]
     GPUDisabled,
+    #[error("Curve not supported on GPU!")]
+    CurveNotSupported,
 }
 
 pub type GPUResult<T> = std::result::Result<T, GPUError>;

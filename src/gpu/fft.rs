@@ -6,6 +6,7 @@ use crate::gpu::{
 use ff::Field;
 use log::info;
 use rust_gpu_tools::*;
+use std::any::TypeId;
 use std::cmp;
 
 const LOG2_MAX_ELEMENTS: usize = 32; // At most 2^32 elements is supported.
@@ -29,6 +30,10 @@ where
     E: Engine,
 {
     pub fn create(priority: bool) -> GPUResult<FFTKernel<E>> {
+        if TypeId::of::<E>() != TypeId::of::<paired::bls12_381::Bls12>() {
+            return Err(GPUError::CurveNotSupported);
+        }
+
         let lock = locks::GPULock::lock();
 
         let devices = opencl::Device::all();
