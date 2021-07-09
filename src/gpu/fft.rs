@@ -29,6 +29,10 @@ where
     E: Engine,
 {
     pub fn create(priority: bool) -> GPUResult<FFTKernel<E>> {
+        if locks::PriorityLock::should_break(priority) {
+            return Err(GPUError::GPUTaken);
+        }
+
         let lock = locks::GPULock::lock();
 
         let devices = opencl::Device::all();
@@ -57,7 +61,7 @@ where
         })
     }
 
-    /// Peforms a FFT round
+    /// Performs a FFT round
     /// * `log_n` - Specifies log2 of number of elements
     /// * `log_p` - Specifies log2 of `p`, (http://www.bealto.com/gpu-fft_group-1.html)
     /// * `deg` - 1=>radix2, 2=>radix4, 3=>radix8, ...
@@ -99,6 +103,10 @@ where
 
     /// Share some precalculated values between threads to boost the performance
     fn setup_pq_omegas(&mut self, omega: &E::Fr, n: usize, max_deg: u32) -> GPUResult<()> {
+        if locks::PriorityLock::should_break(self.priority) {
+            return Err(GPUError::GPUTaken);
+        }
+
         // Precalculate:
         // [omega^(0/(2^(deg-1))), omega^(1/(2^(deg-1))), ..., omega^((2^(deg-1)-1)/(2^(deg-1)))]
         let mut pq = vec![E::Fr::zero(); 1 << max_deg >> 1];
@@ -128,6 +136,10 @@ where
     /// * `omega` - Special value `omega` is used for FFT over finite-fields
     /// * `log_n` - Specifies log2 of number of elements
     pub fn radix_fft(&mut self, a: &mut [E::Fr], omega: &E::Fr, log_n: u32) -> GPUResult<()> {
+        if locks::PriorityLock::should_break(self.priority) {
+            return Err(GPUError::GPUTaken);
+        }
+
         let n = 1 << log_n;
         let mut src_buffer = self.program.create_buffer::<E::Fr>(n)?;
         let mut dst_buffer = self.program.create_buffer::<E::Fr>(n)?;

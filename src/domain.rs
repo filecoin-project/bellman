@@ -301,6 +301,7 @@ fn best_fft<E: Engine, T: Group<E>>(
         {
             return;
         }
+        log::trace!("GPU kernel errored or was interrupted -- falling back to CPU");
     }
 
     let log_cpus = worker.log_num_cpus();

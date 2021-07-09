@@ -3,7 +3,7 @@ use ff::{Field, PrimeField};
 
 #[derive(Clone)]
 pub struct DummyDemo {
-    pub interations: u64,
+    pub iterations: u64,
 }
 
 impl<E: Engine> Circuit<E> for DummyDemo {
@@ -11,7 +11,7 @@ impl<E: Engine> Circuit<E> for DummyDemo {
         let mut x_val = E::Fr::from_str("2");
         let mut x = cs.alloc(|| "", || x_val.ok_or(SynthesisError::AssignmentMissing))?;
 
-        for _ in 0..self.interations {
+        for _ in 0..self.iterations {
             // Allocate: x * x = x2
             let x2_val = x_val.map(|mut e| {
                 e.square();
@@ -58,16 +58,16 @@ pub fn test_parallel_prover() {
     // Higher prio circuit
     let c = DummyDemo {
         #[cfg(not(feature = "_coverage"))]
-        interations: 10_000,
+        iterations: 10_000,
         #[cfg(feature = "_coverage")]
-        interations: 100,
+        iterations: 100,
     };
     // Lower prio circuit
     let c2 = DummyDemo {
         #[cfg(not(feature = "_coverage"))]
-        interations: 500_000,
+        iterations: 500_000,
         #[cfg(feature = "_coverage")]
-        interations: 5000,
+        iterations: 5000,
     };
 
     let params = generate_random_parameters::<Bls12, _, _>(c.clone(), rng).unwrap();
