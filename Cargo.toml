@@ -42,7 +42,8 @@ blstrs = { version = "0.3", optional = true }
 paired = { version = "0.22.0", optional = true }
 
 # gpu feature 
-rust-gpu-tools = { version = "0.3.0", optional = true }
+#rust-gpu-tools = { version = "0.3.0", optional = true }
+rust-gpu-tools = { git = "https://github.com/filecoin-project/rust-gpu-tools", branch = "master", default-features = false, optional = true }
 ff-cl-gen = { version = "0.3.0", optional = true }
 fs2 = { version = "0.4.3", optional = true }
 

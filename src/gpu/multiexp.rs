@@ -101,7 +101,7 @@ where
     E: Engine,
 {
     pub fn create(d: opencl::Device, priority: bool) -> GPUResult<SingleMultiexpKernel<E>> {
-        let src = sources::kernel::<E>(d.brand() == opencl::Brand::Nvidia);
+        let src = sources::kernel::<E>(d.vendor() == opencl::Vendor::Nvidia);
 
         let exp_bits = exp_size::<E>() * 8;
         let core_count = utils::get_core_count(&d);
@@ -111,7 +111,7 @@ where
         let n = std::cmp::min(max_n, best_n);
 
         Ok(SingleMultiexpKernel {
-            program: opencl::Program::from_opencl(d, &src)?,
+            program: opencl::Program::from_opencl(&d, &src)?,
             core_count,
             n,
             priority,
@@ -142,12 +142,12 @@ where
         // be `num_groups` * `num_windows` threads in total.
         // Each thread will use `num_groups` * `num_windows` * `bucket_len` buckets.
 
-        let mut base_buffer = self.program.create_buffer::<G>(n)?;
-        base_buffer.write_from(0, bases)?;
-        let mut exp_buffer = self
+        let base_buffer = self.program.create_buffer::<G>(n)?;
+        self.program.write_from_buffer(&base_buffer, 0, bases)?;
+        let exp_buffer = self
             .program
             .create_buffer::<<<G::Engine as ScalarEngine>::Fr as PrimeField>::Repr>(n)?;
-        exp_buffer.write_from(0, exps)?;
+        self.program.write_from_buffer(&exp_buffer, 0, exps)?;
 
         let bucket_buffer = self
             .program
@@ -156,10 +156,9 @@ where
             .program
             .create_buffer::<<G as CurveAffine>::Projective>(2 * self.core_count)?;
 
-        // Make global work size divisible by `LOCAL_WORK_SIZE`
-        let mut global_work_size = num_windows * num_groups;
-        global_work_size +=
-            (LOCAL_WORK_SIZE - (global_work_size % LOCAL_WORK_SIZE)) % LOCAL_WORK_SIZE;
+        // The global work size follows CUDA's definition and is the number of `LOCAL_WORK_SIZE`
+        // sized thread groups.
+        let global_work_size = (num_windows * num_groups + LOCAL_WORK_SIZE - 1) / LOCAL_WORK_SIZE;
 
         let kernel = self.program.create_kernel(
             if TypeId::of::<G>() == TypeId::of::<E::G1Affine>() {
@@ -170,22 +169,23 @@ where
                 return Err(GPUError::Simple("Only E::G1 and E::G2 are supported!"));
             },
             global_work_size,
-            None,
-        );
+            LOCAL_WORK_SIZE,
+        )?;
 
         kernel
             .arg(&base_buffer)
             .arg(&bucket_buffer)
             .arg(&result_buffer)
             .arg(&exp_buffer)
-            .arg(n as u32)
-            .arg(num_groups as u32)
-            .arg(num_windows as u32)
-            .arg(window_size as u32)
+            .arg(&(n as u32))
+            .arg(&(num_groups as u32))
+            .arg(&(num_windows as u32))
+            .arg(&(window_size as u32))
             .run()?;
 
-        let mut results = vec![<G as CurveAffine>::Projective::zero(); num_groups * num_windows];
-        result_buffer.read_into(0, &mut results)?;
+        let mut results = vec![<G as CurveAffine>::Projective::zero(); 2 * self.core_count];
+        self.program
+            .read_into_buffer(&result_buffer, 0, &mut results)?;
 
         // Using the algorithm below, we can calculate the final result by accumulating the results
         // of those `NUM_GROUPS` * `NUM_WINDOWS` threads.
@@ -251,7 +251,7 @@ where
             info!(
                 "Multiexp: Device {}: {} (Chunk-size: {})",
                 i,
-                k.program.device().name(),
+                k.program.device_name(),
                 k.n
             );
         }
